@@ -2,7 +2,6 @@
 import json
 from io import BytesIO
 from datetime import datetime
-
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -12,40 +11,64 @@ st.set_page_config(page_title="📦 保單策略規劃 | 永傳家族傳承教�
 st.title("📦 保單策略規劃｜永傳家族傳承教練")
 st.caption("為高資產家庭設計最適保障結構，讓每一分資源，都能守護最重要的事。｜聯絡信箱：123@gracefo.com")
 
+REQUIRED_BASE_COLS = ["company","product_name","currency","pay_term_years"]
+OPTIONAL_COLS = ["min_age","max_age","gender_limit","tags","highlight","annual_premium_base",
+                 "premium_multiplier_male","premium_multiplier_female","age_factor_json",
+                 "cash_value_90_predicted","death_benefit_90_predicted",
+                 "cash_value_90_declared","death_benefit_90_declared",
+                 "irr_to_90_predicted","irr_to_90_declared"]
+
 # ---------------------- 載入資料 ----------------------
 @st.cache_data
 def load_products(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    # 清理欄位
-    for col in ["premium_multiplier_male", "premium_multiplier_female"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(1.0)
-    # 年期整數
-    if "pay_term_years" in df.columns:
-        df["pay_term_years"] = pd.to_numeric(df["pay_term_years"], errors="coerce").astype("Int64")
-    # 年齡上下限
-    for col in ["min_age", "max_age"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    # 預設 JSON 欄位
-    if "age_factor_json" in df.columns:
-        df["age_factor_json"] = df["age_factor_json"].fillna("")
-    else:
-        df["age_factor_json"] = ""
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        st.error(f"讀取 products.csv 失敗：{e}")
+        return pd.DataFrame()
+
+    # 檢查必要欄位
+    missing = [c for c in REQUIRED_BASE_COLS if c not in df.columns]
+    if missing:
+        st.error(f"products.csv 缺少必要欄位：{missing}")
+        return pd.DataFrame()
+
+    # 預設補齊選填欄位
+    for c in OPTIONAL_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    # 型別清理
+    df["currency"] = df["currency"].astype(str).str.upper()
+    df["pay_term_years"] = pd.to_numeric(df["pay_term_years"], errors="coerce")
+    df["min_age"] = pd.to_numeric(df["min_age"], errors="coerce")
+    df["max_age"] = pd.to_numeric(df["max_age"], errors="coerce")
+    df["premium_multiplier_male"] = pd.to_numeric(df["premium_multiplier_male"], errors="coerce").fillna(1.0)
+    df["premium_multiplier_female"] = pd.to_numeric(df["premium_multiplier_female"], errors="coerce").fillna(1.0)
+    df["annual_premium_base"] = pd.to_numeric(df["annual_premium_base"], errors="coerce").fillna(0.0)
+    df["gender_limit"] = df["gender_limit"].astype(str).str.upper().fillna("ANY")
+    df["age_factor_json"] = df["age_factor_json"].fillna("")
+
+    for c in ["cash_value_90_predicted","death_benefit_90_predicted",
+              "cash_value_90_declared","death_benefit_90_declared",
+              "irr_to_90_predicted","irr_to_90_declared"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
     return df
 
 df = load_products("products.csv")
 
 if df.empty:
-    st.warning("尚未載入任何商品資料。請先準備 products.csv。")
+    st.warning("尚未載入任何商品資料或資料缺欄位。請先準備符合欄位的 products.csv。")
     st.stop()
 
 # ---------------------- 側邊欄：輸入條件 ----------------------
 st.sidebar.header("客戶條件")
 gender = st.sidebar.selectbox("性別", ["男", "女"])
 age = st.sidebar.number_input("年齡", min_value=0, max_value=100, value=45, step=1)
-currency = st.sidebar.selectbox("幣別", ["TWD", "USD"])
-pay_term = st.sidebar.selectbox("繳費年期（年）", sorted(df["pay_term_years"].dropna().unique().tolist()))
+currency = st.sidebar.selectbox("幣別", sorted(df["currency"].dropna().unique().tolist()))
+pay_term_choices = sorted(pd.to_numeric(df["pay_term_years"], errors="coerce").dropna().unique().tolist())
+pay_term = st.sidebar.selectbox("繳費年期（年）", pay_term_choices if pay_term_choices else [6,10,20])
 budget_mode = st.sidebar.selectbox("預算輸入方式", ["年繳", "月繳"])
 budget_value = st.sidebar.number_input(f"{budget_mode}預算金額", min_value=0, value=500000 if budget_mode=="年繳" else 40000, step=1000)
 budget_yearly = budget_value if budget_mode == "年繳" else budget_value * 12
@@ -75,18 +98,19 @@ w_sum = w_fit + w_ratio + w_cash + w_irr
 if w_sum != 100:
     st.sidebar.error(f"權重合計需為 100，目前為 {w_sum}。")
 
-# ---------------------- 資料過濾 ----------------------
+# ---------------------- 過濾與衍生欄位 ----------------------
 work = df.copy()
-work = work[(work["currency"] == currency)]
-work = work[(work["pay_term_years"] == pay_term)]
-work = work[(work["min_age"].fillna(0) <= age) & (work["max_age"].fillna(200) >= age)]
-if gender == "男":
-    gender_key = "M"
-    gender_multiplier_col = "premium_multiplier_male"
-else:
-    gender_key = "F"
-    gender_multiplier_col = "premium_multiplier_female"
 
+# 先做基本過濾
+work = work[(work["currency"] == currency)]
+work = work[(work["pay_term_years"] == float(pay_term))]
+work = work[(work["min_age"].fillna(0) <= age) & (work["max_age"].fillna(200) >= age)]
+
+# 性別設定
+gender_key = "M" if gender == "男" else "F"
+gender_multiplier_col = "premium_multiplier_male" if gender == "男" else "premium_multiplier_female"
+
+# 年齡係數
 def apply_age_factor(row, age):
     raw = row.get("age_factor_json", "")
     if not raw:
@@ -95,7 +119,6 @@ def apply_age_factor(row, age):
         mapping = json.loads(raw)
     except Exception:
         return 1.0
-    # key 形式 "40-49": 1.1
     for k, v in mapping.items():
         try:
             a, b = k.split("-")
@@ -106,13 +129,23 @@ def apply_age_factor(row, age):
             continue
     return 1.0
 
-# 年繳保費估算
+# 保費計算（確保欄位存在）
+if "annual_premium" not in work.columns:
+    work["annual_premium"] = 0.0
+
 work["annual_premium"] = (
-    pd.to_numeric(work.get("annual_premium_base", 0), errors="coerce").fillna(0)
-    * pd.to_numeric(work.get(gender_multiplier_col, 1.0), errors="coerce").fillna(1.0)
+    work["annual_premium_base"].fillna(0.0)
+    * work[gender_multiplier_col].fillna(1.0)
     * work.apply(lambda r: apply_age_factor(r, age), axis=1)
 ).round(0)
-work["total_premium"] = (work["annual_premium"] * work["pay_term_years"]).round(0)
+
+# 總繳保費（若不存在則補上）
+if "total_premium" not in work.columns:
+    work["total_premium"] = np.nan
+work["total_premium"] = (
+    work["annual_premium"].fillna(0).astype(float) *
+    pd.to_numeric(work["pay_term_years"], errors="coerce").fillna(0).astype(float)
+).round(0)
 
 # 預算過濾（允許 +10% 彈性）
 budget_upper = budget_yearly * 1.10
@@ -122,10 +155,9 @@ work = work[work["annual_premium"] <= budget_upper]
 def gender_ok(v):
     v = str(v).upper()
     return v in ("ANY", "") or gender_key in v
-
 work = work[work["gender_limit"].apply(gender_ok)]
 
-# 指標選擇（情境切換）
+# 情境欄位
 cash_col  = "cash_value_90_predicted" if scenario == "預定利率" else "cash_value_90_declared"
 death_col = "death_benefit_90_predicted" if scenario == "預定利率" else "death_benefit_90_declared"
 irr_col   = "irr_to_90_predicted" if scenario == "預定利率" else "irr_to_90_declared"
@@ -135,39 +167,36 @@ for col in [cash_col, death_col, irr_col]:
         work[col] = np.nan
     work[col] = pd.to_numeric(work[col], errors="coerce")
 
-# 衍生指標
-work["coverage_premium_ratio"] = work[death_col] / work["total_premium"]
-work["irr_pct"] = work[irr_col] * 100.0
-
-# 進階過濾
-if irr_floor:
-    work = work[work["irr_pct"].fillna(-999) >= irr_floor]
-if coverage_premium_ceiling and coverage_premium_ceiling > 0:
-    work = work[work["coverage_premium_ratio"].fillna(0) <= coverage_premium_ceiling]
-
 if work.empty:
     st.warning("沒有符合條件的商品。建議：放寬預算、切換幣別或調整年期與權重後重試。")
     st.stop()
 
-# 目標適配度：以 tags 與 highlight 關鍵詞粗略評分
+# 衍生指標（避免除以 0 或缺欄）
+work["coverage_premium_ratio"] = np.where(
+    work["total_premium"].fillna(0) > 0,
+    work[death_col] / work["total_premium"],
+    np.nan
+)
+work["irr_pct"] = work[irr_col] * 100.0
+
+# 目標適配度
 def fit_score(row):
-    tags = str(row.get("tags", "")).split(",")
-    text = " ".join(tags) + " " + str(row.get("highlight", ""))
+    tags = str(row.get("tags", "") or "").split(",")
+    text = " ".join(tags) + " " + str(row.get("highlight", "") or "")
     score = 0
     for p in purposes:
-        if p in text:
+        if p and (p in text):
             score += 1
     if need_high_cash and "高現金價值" in text:
         score += 1
-    if prefer_big_brand and ("大" in text or "旗艦" in text):
+    if prefer_big_brand and ("品牌" in text or "旗艦" in text or "大" in text):
         score += 1
-    # 歸一（最多 5 分 → 0~1）
     return min(score, 5) / 5.0
 
 work["fit_norm"] = work.apply(fit_score, axis=1)
 
-# 數值指標正規化（同幣別＆年期群組）
-def minmax(s):
+# 正規化工具
+def minmax(s: pd.Series):
     s = s.replace([np.inf, -np.inf], np.nan).dropna()
     if s.empty:
         return None
@@ -176,22 +205,22 @@ def minmax(s):
         return None
     return (lo, hi)
 
-mm_cash = minmax(work[cash_col])
-mm_ratio = minmax(work["coverage_premium_ratio"])
-
 def norm_val(v, mm):
     if mm is None or pd.isna(v):
         return 0.0
     lo, hi = mm
     return float((v - lo) / (hi - lo)) if hi > lo else 0.0
 
+mm_cash = minmax(work[cash_col])
+mm_ratio = minmax(work["coverage_premium_ratio"])
+
 work["cash_norm"] = work[cash_col].apply(lambda v: norm_val(v, mm_cash))
 work["ratio_norm"] = work["coverage_premium_ratio"].apply(lambda v: norm_val(v, mm_ratio))
-work["irr_norm"] = work["irr_pct"].fillna(-999)
-# IRR 直接用百分比映射到 0~1（-5%~15% 範圍）
-work["irr_norm"] = work["irr_norm"].clip(-5, 15).apply(lambda x: (x + 5) / 20.0)
 
-# 綜合分數（0~100）
+# IRR 轉 0~1
+work["irr_norm"] = work["irr_pct"].fillna(-5).clip(-5, 15).apply(lambda x: (x + 5) / 20.0)
+
+# 綜合分數
 work["score"] = (
     work["fit_norm"]  * w_fit +
     work["ratio_norm"]* w_ratio +
@@ -199,7 +228,6 @@ work["score"] = (
     work["irr_norm"]  * w_irr
 ).round(2)
 
-# 排序
 work = work.sort_values(["score", cash_col, "coverage_premium_ratio"], ascending=[False, False, False])
 
 # ---------------------- 推薦區塊 ----------------------
@@ -226,6 +254,8 @@ for i, (_, r) in enumerate(top3.iterrows()):
 
 # ---------------------- 結果表格 ----------------------
 st.subheader("📊 商品比較")
+cash_label = "90歲解約金"
+death_label = "90歲身故理賠"
 display_cols = [
     "company","product_name","currency","pay_term_years","annual_premium","total_premium",
     cash_col, death_col, "coverage_premium_ratio","irr_pct","highlight"
@@ -233,12 +263,12 @@ display_cols = [
 rename = {
     "company":"公司","product_name":"商品","currency":"幣別","pay_term_years":"年期",
     "annual_premium":"年繳保費","total_premium":"總繳保費",
-    cash_col:"90歲解約金", death_col:"90歲身故理賠",
+    cash_col:cash_label, death_col:death_label,
     "coverage_premium_ratio":"保障/保費比","irr_pct":"IRR(%)","highlight":"亮點"
 }
 table = work[display_cols].rename(columns=rename).copy()
-# 千分位格式化
-for c in ["年繳保費","總繳保費","90歲解約金","90歲身故理賠"]:
+
+for c in ["年繳保費","總繳保費",cash_label,death_label]:
     table[c] = table[c].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "-")
 table["保障/保費比"] = work["coverage_premium_ratio"].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "-")
 table["IRR(%)"] = work["irr_pct"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
@@ -250,7 +280,6 @@ st.markdown("### ⬇ 下載")
 csv_bytes = work.to_csv(index=False).encode("utf-8-sig")
 st.download_button("下載篩選結果（CSV）", data=csv_bytes, file_name="recommendations.csv", mime="text/csv")
 
-# 簡易 PDF（使用 reportlab，如環境未安裝則提示）
 if st.button("匯出精簡報告（PDF）"):
     try:
         from reportlab.lib.pagesizes import A4
@@ -270,7 +299,7 @@ if st.button("匯出精簡報告（PDF）"):
         # 客戶條件
         y = H - 32*mm
         c.setFont("Helvetica", 10)
-        cond = f"條件：{gender}／{int(age)}歲／{currency}／{pay_term}年期／年預算≤{int(budget_yearly):,}"
+        cond = f"條件：{gender}／{int(age)}歲／{currency}／{int(pay_term)}年期／年預算≤{int(budget_yearly):,}"
         c.drawString(20*mm, y, cond); y -= 8*mm
 
         # Top 3
